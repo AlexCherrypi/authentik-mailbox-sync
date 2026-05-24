@@ -26,4 +26,4 @@ COPY app/ ./app/
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 5000
-CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "app.webhook:app"]
+CMD ["gunicorn", "-w", "2", "--timeout", "600", "-b", "0.0.0.0:5000", "app.webhook:app"]
