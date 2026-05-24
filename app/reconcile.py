@@ -110,6 +110,7 @@ def reconcile_user(
     dovecot=None,
     memcached=None,
     mailcow_db=None,
+    sogo=None,
     our_domain: str,
     imap_host: str,
     imap_port: int,
@@ -148,6 +149,9 @@ def reconcile_user(
         "sender_acl_removed": [],
         "acl_granted": [],
         "acl_revoked": [],
+        "sogo_delegate_from_set": False,
+        "sogo_delegate_to_added": [],
+        "sogo_delegate_to_removed": [],
         "memcached_flushed": False,
         "errors": [],
     }
@@ -218,6 +222,7 @@ def reconcile_user(
             user_email, desired_shared,
             all_mailboxes=all_mailboxes,
             mailcow=mailcow, mailcow_db=mailcow_db, dovecot=dovecot,
+            sogo=sogo,
             our_domain=our_domain, dry_run=dry_run,
             summary=summary,
         )
@@ -240,6 +245,7 @@ def _reconcile_sharing(
     mailcow,
     mailcow_db,
     dovecot,
+    sogo,
     our_domain: str,
     dry_run: bool,
     summary: dict,
@@ -264,6 +270,41 @@ def _reconcile_sharing(
         except Exception as exc:
             summary["errors"].append(f"mailcow_db.get_all_sender_acls: {exc}")
             log.exception("get_all_sender_acls failed")
+
+    # Read SOGo's current DelegateTo for every mailbox once (so per-mailbox
+    # decisions don't each hit the DB). Empty dict if no SOGo client.
+    sogo_delegate_to: dict[str, set[str]] = {}
+    if sogo is not None:
+        try:
+            sogo_delegate_to = sogo.get_all_delegate_to()
+        except Exception as exc:
+            summary["errors"].append(f"sogo.get_all_delegate_to: {exc}")
+            log.exception("get_all_delegate_to failed")
+
+    # The user's own Mail.DelegateFrom + Mail.OtherUsersFolders should mirror
+    # desired_shared. Compute the diff up front so per-mailbox loop only
+    # handles DelegateTo on the *other* side.
+    if sogo is not None:
+        try:
+            current_df = sogo.get_delegate_from(user_email)
+            if current_df != desired_shared:
+                log.info("sogo DelegateFrom %s: %s -> %s",
+                         user_email, sorted(current_df), sorted(desired_shared))
+                if not dry_run:
+                    try:
+                        sogo.set_user_delegate_from(user_email, desired_shared)
+                    except Exception as exc:
+                        summary["errors"].append(
+                            f"sogo.set_user_delegate_from {user_email}: {exc}")
+                    else:
+                        summary["sogo_delegate_from_set"] = True
+                        changed = True
+                else:
+                    summary["sogo_delegate_from_set"] = True
+                    changed = True
+        except Exception as exc:
+            summary["errors"].append(f"sogo.get_delegate_from {user_email}: {exc}")
+            log.exception("get_delegate_from failed")
 
     for mb in all_mailboxes:
         target = mb.get("username", "")
@@ -331,6 +372,33 @@ def _reconcile_sharing(
                     summary["errors"].append(f"dovecot revoke {target}: {exc}")
                     continue
             summary["acl_revoked"].append(target)
+            changed = True
+
+        # --- SOGo Mail.DelegateTo on the shared mailbox's profile ---
+        if sogo is None:
+            continue
+        current_dt = sogo_delegate_to.get(target, set())
+        if want and user_email not in current_dt:
+            log.info("sogo DelegateTo ADD: %s on %s (dry_run=%s)",
+                     user_email, target, dry_run)
+            if not dry_run:
+                try:
+                    sogo.add_user_to_mailbox_delegate_to(target, user_email)
+                except Exception as exc:
+                    summary["errors"].append(f"sogo DelegateTo add {target}: {exc}")
+                    continue
+            summary["sogo_delegate_to_added"].append(target)
+            changed = True
+        elif (not want) and user_email in current_dt:
+            log.info("sogo DelegateTo DEL: %s on %s (dry_run=%s)",
+                     user_email, target, dry_run)
+            if not dry_run:
+                try:
+                    sogo.remove_user_from_mailbox_delegate_to(target, user_email)
+                except Exception as exc:
+                    summary["errors"].append(f"sogo DelegateTo del {target}: {exc}")
+                    continue
+            summary["sogo_delegate_to_removed"].append(target)
             changed = True
 
     return changed
