@@ -101,31 +101,56 @@ def healthz():
     return jsonify(out), code
 
 
+def _reconcile_one(user_payload: dict, dry_run: bool) -> dict:
+    return reconcile_user(
+        user_payload,
+        state=state,
+        mailcow=mailcow,
+        nextcloud=nextcloud,
+        dovecot=dovecot,
+        memcached=memcached,
+        mailcow_db=mailcow_db,
+        sogo=sogo,
+        our_domain=os.environ["OUR_DOMAIN"],
+        imap_host=os.environ["IMAP_HOST"],
+        imap_port=int(os.environ.get("IMAP_PORT", "993")),
+        imap_enc=os.environ.get("IMAP_ENCRYPTION", "ssl"),
+        smtp_host=os.environ["SMTP_HOST"],
+        smtp_port=int(os.environ.get("SMTP_PORT", "465")),
+        smtp_enc=os.environ.get("SMTP_ENCRYPTION", "ssl"),
+        dry_run=dry_run,
+    )
+
+
 @app.route("/reconcile", methods=["POST"])
 @require_token("SYNC_WEBHOOK_SECRET")
 def reconcile():
     payload = request.get_json(silent=True) or {}
     dry_run = _dry_run()
-    log.info("reconcile user=%s dry_run=%s", payload.get("email"), dry_run)
+
+    # Multi-user form: Authentik event-driven payload wraps zero or more
+    # users in ``users_to_reconcile``. Each entry has the same shape as the
+    # single-user form.
+    if isinstance(payload.get("users_to_reconcile"), list):
+        users = payload["users_to_reconcile"]
+        log.info("reconcile multi-user count=%d dry_run=%s", len(users), dry_run)
+        results = []
+        for u in users:
+            if not isinstance(u, dict):
+                results.append({"error": "invalid user payload", "payload": u})
+                continue
+            try:
+                results.append(_reconcile_one(u, dry_run))
+            except Exception as exc:
+                log.exception("reconcile crashed for user=%s", u.get("email"))
+                results.append({"error": str(exc), "user_email": u.get("email")})
+        return jsonify({"dry_run": dry_run, "count": len(results), "results": results}), 200
+
+    # Single-user form (direct API calls or legacy webhook payload)
+    log.info("reconcile single-user user=%s dry_run=%s",
+             payload.get("email"), dry_run)
     try:
-        result = reconcile_user(
-            payload,
-            state=state,
-            mailcow=mailcow,
-            nextcloud=nextcloud,
-            dovecot=dovecot,
-            memcached=memcached,
-            mailcow_db=mailcow_db,
-            sogo=sogo,
-            our_domain=os.environ["OUR_DOMAIN"],
-            imap_host=os.environ["IMAP_HOST"],
-            imap_port=int(os.environ.get("IMAP_PORT", "993")),
-            imap_enc=os.environ.get("IMAP_ENCRYPTION", "ssl"),
-            smtp_host=os.environ["SMTP_HOST"],
-            smtp_port=int(os.environ.get("SMTP_PORT", "465")),
-            smtp_enc=os.environ.get("SMTP_ENCRYPTION", "ssl"),
-            dry_run=dry_run,
-        )
+        result = _reconcile_one(payload, dry_run)
     except Exception as exc:
         log.exception("reconcile crashed for user=%s", payload.get("email"))
         return jsonify({"error": str(exc)}), 500
