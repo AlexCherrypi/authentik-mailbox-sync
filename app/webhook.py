@@ -1,11 +1,12 @@
-"""Authentik Mailbox Reconciler — Flask entry point.
+"""Authentik Mailbox Sync — Flask entry point.
 
 Endpoints in Phase 1:
 - GET  /healthz       — liveness + dependency check (no auth)
-- POST /reconcile     — single-user webhook (HMAC-style token in Task 003)
-- POST /reconcile-all — full sweep, called by TrueNAS cron (admin token in Task 008)
+- POST /reconcile     — single-user webhook (X-Sync-Webhook-Token)
+- POST /reconcile-all — full sweep, called by cron (X-Sync-Admin-Token)
 
-Current state: skeleton only. /reconcile and /reconcile-all return 200 noop.
+Current state: skeleton. /reconcile and /reconcile-all return 200 noop —
+the reconcile core lands in task 004 and the sweep in task 008.
 """
 import logging
 import os
@@ -13,6 +14,7 @@ import sys
 
 from flask import Flask, jsonify
 
+from .auth import require_token
 from .mailcow.api import MailcowClient
 from .state import StateDB
 
@@ -21,7 +23,7 @@ logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
     stream=sys.stdout,
 )
-log = logging.getLogger("reconciler")
+log = logging.getLogger("sync")
 
 app = Flask(__name__)
 
@@ -60,12 +62,14 @@ def healthz():
 
 
 @app.route("/reconcile", methods=["POST"])
+@require_token("SYNC_WEBHOOK_SECRET")
 def reconcile():
-    log.info("reconcile called — skeleton noop (auth+logic land in tasks 003+004)")
-    return jsonify({"status": "noop", "todo": "tasks-003-004"}), 200
+    log.info("reconcile called — skeleton noop (logic lands in task 004)")
+    return jsonify({"status": "noop", "todo": "task-004"}), 200
 
 
 @app.route("/reconcile-all", methods=["POST"])
+@require_token("SYNC_ADMIN_TOKEN")
 def reconcile_all():
     log.info("reconcile-all called — skeleton noop (sweep lands in task 008)")
     return jsonify({"status": "noop", "todo": "task-008"}), 200
