@@ -7,6 +7,7 @@ service config so different deployments can point to different containers.
 import json
 import logging
 import subprocess
+import time
 from typing import Optional
 
 log = logging.getLogger("sync.nextcloud")
@@ -17,9 +18,12 @@ class NextcloudError(RuntimeError):
 
 
 class NextcloudClient:
-    def __init__(self, container: str, timeout: float = 15.0):
+    def __init__(self, container: str, timeout: float = 15.0,
+                 user_cache_ttl: float = 60.0):
         self.container = container
         self.timeout = timeout
+        self.user_cache_ttl = user_cache_ttl
+        self._user_cache: Optional[tuple[float, set[str]]] = None
 
     def _exec(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         cmd = ["docker", "exec", self.container, "php", "occ", *args]
@@ -44,6 +48,33 @@ class NextcloudClient:
                 except json.JSONDecodeError:
                     break
         return []
+
+    def list_user_ids(self) -> set[str]:
+        """Return the set of Nextcloud user IDs. Result is cached for
+        ``user_cache_ttl`` seconds so a sweep over many users only pays
+        for one ``occ user:list`` call total."""
+        now = time.time()
+        if self._user_cache and (now - self._user_cache[0]) < self.user_cache_ttl:
+            return self._user_cache[1]
+        proc = self._exec("user:list", "--output=json", check=False)
+        if proc.returncode != 0:
+            log.warning("user:list failed (rc=%s): %s",
+                        proc.returncode, proc.stderr.strip()[:200])
+            # Don't cache a failure — next caller can retry
+            return set()
+        data = self._parse_json_lenient(proc.stdout)
+        # occ user:list --output=json yields a {uid: display_name} object
+        if isinstance(data, dict):
+            users = set(data.keys())
+        elif isinstance(data, list):
+            users = {str(u) for u in data}
+        else:
+            users = set()
+        self._user_cache = (now, users)
+        return users
+
+    def user_exists(self, user_id: str) -> bool:
+        return user_id in self.list_user_ids()
 
     def list_mail_accounts(self, user_id: str) -> list[dict]:
         proc = self._exec("mail:account:export", user_id, "--output=json", check=False)

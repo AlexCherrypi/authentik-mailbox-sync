@@ -145,6 +145,7 @@ def reconcile_user(
         "added": [],
         "removed": [],
         "skipped_unknown_mailbox": [],
+        "skipped_nc_user_missing": False,
         "sender_acl_added": [],
         "sender_acl_removed": [],
         "acl_granted": [],
@@ -188,6 +189,29 @@ def reconcile_user(
 
         to_add = sorted(actionable - current_targets)
         to_remove = sorted(current_targets - actionable)
+
+        # Adds need a working Nextcloud user — the App-Password + NC mail
+        # account come as a pair (the App-Password only exists so the NC
+        # mail account can authenticate against IMAP). When the user
+        # hasn't logged into Nextcloud yet, NC has no user record for them,
+        # so the create would always fail and we'd churn through
+        # add-then-rollback for every target. Detect that once and skip
+        # the loop. The sharing-side (sender_acl, Dovecot ACL, SOGo
+        # delegations) still runs — those are Mailcow-only and let the
+        # user reach the shared mailboxes via SOGo webmail right away.
+        if to_add and not dry_run:
+            try:
+                nc_user_present = nextcloud.user_exists(user_email)
+            except Exception as exc:
+                log.warning("nextcloud.user_exists(%s) failed (%s); falling back "
+                            "to attempting adds individually", user_email, exc)
+                nc_user_present = True  # fall through to old behavior
+            if not nc_user_present:
+                log.info("NC user %s does not exist — skipping %d add(s); "
+                         "will self-heal once the user first logs into Nextcloud",
+                         user_email, len(to_add))
+                summary["skipped_nc_user_missing"] = True
+                to_add = []
 
         for target in to_add:
             try:
