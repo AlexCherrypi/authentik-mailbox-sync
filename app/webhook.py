@@ -3,7 +3,10 @@
 Endpoints:
 - GET  /healthz       — liveness + dependency check (no auth)
 - POST /reconcile     — single-user reconcile (X-Sync-Webhook-Token)
-- POST /reconcile-all — full sweep (X-Sync-Admin-Token) — noop in this commit
+- POST /reconcile-all — sweep: pull canonical user list from Authentik,
+                        reconcile every active user, then garbage-collect
+                        users that vanished from Authentik but still have
+                        rows in our state DB (X-Sync-Admin-Token)
 
 Dry-run behaviour: ``SYNC_DRY_RUN=true`` env var or ``?dry_run=1`` query
 param makes the service compute the diff and return what it would do without
@@ -16,6 +19,7 @@ import sys
 from flask import Flask, jsonify, request
 
 from .auth import require_token
+from .authentik import AuthentikClient
 from .mailcow.api import MailcowClient
 from .mailcow.db import MailcowDB
 from .mailcow.dovecot import DovecotClient
@@ -62,6 +66,21 @@ if all(os.environ.get(k) for k in ("MAILCOW_DB_HOST", "MAILCOW_DB_NAME",
         port=int(os.environ.get("MAILCOW_DB_PORT", "3306")),
     )
     sogo = SogoPrefs(mailcow_db)
+
+authentik = None
+if os.environ.get("AUTHENTIK_API_URL") and os.environ.get("AUTHENTIK_API_TOKEN"):
+    verify_env = os.environ.get("AUTHENTIK_API_VERIFY", "")
+    if verify_env.lower() in ("false", "0", "no", "off"):
+        verify: bool | str = False
+    elif verify_env:
+        verify = verify_env
+    else:
+        verify = True
+    authentik = AuthentikClient(
+        base_url=os.environ["AUTHENTIK_API_URL"],
+        token=os.environ["AUTHENTIK_API_TOKEN"],
+        verify=verify,
+    )
 
 
 def _truthy(v: str) -> bool:
@@ -162,5 +181,64 @@ def reconcile():
 @app.route("/reconcile-all", methods=["POST"])
 @require_token("SYNC_ADMIN_TOKEN")
 def reconcile_all():
-    log.info("reconcile-all called — skeleton noop (sweep lands in task 008)")
-    return jsonify({"status": "noop", "todo": "task-008"}), 200
+    """Full sweep: pull canonical user list from Authentik, reconcile each
+    one, then garbage-collect users that vanished from Authentik but still
+    have state-DB rows from a previous sync."""
+    dry_run = _dry_run()
+
+    if authentik is None:
+        msg = ("AUTHENTIK_API_URL / AUTHENTIK_API_TOKEN not configured — "
+               "/reconcile-all requires both")
+        log.warning(msg)
+        return jsonify({"status": "skipped", "reason": msg, "dry_run": dry_run}), 503
+
+    our_domain = os.environ["OUR_DOMAIN"]
+    log.info("reconcile-all START dry_run=%s domain=%s", dry_run, our_domain)
+
+    try:
+        authentik_payloads = authentik.list_users_for_sync(our_domain)
+    except Exception as exc:
+        log.exception("authentik.list_users_for_sync failed")
+        return jsonify({"status": "error", "reason": f"authentik fetch: {exc}"}), 502
+
+    authentik_emails = {p["email"] for p in authentik_payloads}
+    known_emails = set(state.known_users())
+    orphan_emails = sorted(known_emails - authentik_emails)
+
+    results = []
+    for payload in authentik_payloads:
+        try:
+            results.append(_reconcile_one(payload, dry_run))
+        except Exception as exc:
+            log.exception("reconcile-all crashed for user=%s", payload.get("email"))
+            results.append({"error": str(exc), "user_email": payload.get("email")})
+
+    # Garbage-collect: any user we have state for that is no longer in
+    # Authentik — reconcile with empty additional_emails so the diff path
+    # tears down every (user, target) row we ever created for them.
+    gc_results = []
+    for email in orphan_emails:
+        log.info("reconcile-all GC orphan user=%s dry_run=%s", email, dry_run)
+        gc_payload = {
+            "email": email,
+            "primary_email": email,
+            "shared_mailboxes": [],
+            "additional_emails": [],
+        }
+        try:
+            gc_results.append(_reconcile_one(gc_payload, dry_run))
+        except Exception as exc:
+            log.exception("reconcile-all GC crashed for user=%s", email)
+            gc_results.append({"error": str(exc), "user_email": email})
+
+    summary = {
+        "status": "ok",
+        "dry_run": dry_run,
+        "authentik_users": len(authentik_payloads),
+        "orphan_users": orphan_emails,
+        "reconciled": results,
+        "garbage_collected": gc_results,
+    }
+    log.info("reconcile-all DONE authentik=%d orphans=%d dry_run=%s",
+             len(authentik_payloads), len(orphan_emails), dry_run)
+    return jsonify(summary), 200
