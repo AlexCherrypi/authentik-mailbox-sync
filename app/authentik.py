@@ -69,7 +69,10 @@ class AuthentikClient:
         """Return one payload per Authentik user, in the same shape that
         ``reconcile_user`` accepts. ``shared_mailboxes`` is the union over all
         of the user's groups' ``attributes.shared_mailboxes`` (de-duped, with
-        the user's own primary email removed)."""
+        the user's own primary email removed).
+
+        Service-account user types are skipped — they don't have human
+        mailboxes to reconcile."""
         payloads: list[dict] = []
         for u in self.list_users_raw():
             email = (u.get("email") or "").strip()
@@ -77,6 +80,9 @@ class AuthentikClient:
                 continue
             if not email.endswith("@" + our_domain):
                 # Foreign-domain user — we never reconcile those
+                continue
+            if u.get("type") != "internal":
+                # Skip internal_service_account, external, internal_service etc.
                 continue
 
             mailboxes: set[str] = set()
@@ -94,5 +100,5 @@ class AuthentikClient:
                 "shared_mailboxes": sorted(mailboxes),
                 "additional_emails": sorted(mailboxes),
             })
-        log.info("authentik: fetched %d active users in %s", len(payloads), our_domain)
+        log.info("authentik: fetched %d internal users in %s", len(payloads), our_domain)
         return payloads
