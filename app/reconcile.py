@@ -107,6 +107,9 @@ def reconcile_user(
     state: StateDB,
     mailcow,
     nextcloud,
+    dovecot=None,
+    memcached=None,
+    mailcow_db=None,
     our_domain: str,
     imap_host: str,
     imap_port: int,
@@ -141,18 +144,24 @@ def reconcile_user(
         "added": [],
         "removed": [],
         "skipped_unknown_mailbox": [],
+        "sender_acl_added": [],
+        "sender_acl_removed": [],
+        "acl_granted": [],
+        "acl_revoked": [],
+        "memcached_flushed": False,
         "errors": [],
     }
 
     with per_key_lock(user_email):
         try:
-            existing_mbs = {mb["username"] for mb in mailcow.list_mailboxes()
-                            if mb.get("username", "").endswith("@" + our_domain)}
+            all_mailboxes = mailcow.list_mailboxes()
         except Exception as exc:
             summary["errors"].append(f"mailcow.list_mailboxes: {exc}")
             log.exception("list_mailboxes failed for user=%s", user_email)
             return summary
 
+        existing_mbs = {mb["username"] for mb in all_mailboxes
+                        if mb.get("username", "").endswith("@" + our_domain)}
         actionable = desired & existing_mbs
         unknown = desired - existing_mbs
         summary["skipped_unknown_mailbox"] = sorted(unknown)
@@ -202,10 +211,129 @@ def reconcile_user(
                 summary["errors"].append(f"remove {target}: {exc}")
                 log.exception("remove %s for user %s failed", target, user_email)
 
+        # Sharing-side reconcile (sender_acl + Dovecot ACL) — independent of
+        # app-pwd lifecycle. desired_shared excludes the user's own mailbox.
+        desired_shared = actionable - {user_email}
+        sharing_changed = _reconcile_sharing(
+            user_email, desired_shared,
+            all_mailboxes=all_mailboxes,
+            mailcow=mailcow, mailcow_db=mailcow_db, dovecot=dovecot,
+            our_domain=our_domain, dry_run=dry_run,
+            summary=summary,
+        )
+
+        if memcached is not None and sharing_changed and not dry_run:
+            if memcached.flush_all():
+                summary["memcached_flushed"] = True
+
         if not dry_run:
             state.touch_user(user_email)
 
     return summary
+
+
+def _reconcile_sharing(
+    user_email: str,
+    desired_shared: set[str],
+    *,
+    all_mailboxes: list[dict],
+    mailcow,
+    mailcow_db,
+    dovecot,
+    our_domain: str,
+    dry_run: bool,
+    summary: dict,
+) -> bool:
+    """Walk every LKS-domain mailbox (except the user's own) and bring its
+    ``sender_acl`` + Dovecot ACLs into agreement with *desired_shared* for the
+    *user_email* slice.
+
+    Other entries in those ACLs (other users, manual entries) are not touched.
+
+    Returns True if anything actually changed (used to decide if memcached
+    needs flushing)."""
+    changed = False
+
+    # Read current sender_acl rows once (mailcow REST has no read endpoint, so
+    # we hit the DB directly). Skip sender_acl handling entirely if no DB
+    # client was configured.
+    sender_acls: dict[str, set[str]] = {}
+    if mailcow_db is not None:
+        try:
+            sender_acls = mailcow_db.get_all_sender_acls()
+        except Exception as exc:
+            summary["errors"].append(f"mailcow_db.get_all_sender_acls: {exc}")
+            log.exception("get_all_sender_acls failed")
+
+    for mb in all_mailboxes:
+        target = mb.get("username", "")
+        if not target.endswith("@" + our_domain) or target == user_email:
+            continue
+
+        want = target in desired_shared
+        current_acl = sender_acls.get(target, set())
+
+        # --- sender_acl ---
+        if want and user_email not in current_acl:
+            log.info("sender_acl ADD: %s on %s (dry_run=%s)",
+                     user_email, target, dry_run)
+            if not dry_run:
+                try:
+                    new_acl = sorted(current_acl | {user_email})
+                    mailcow.edit_mailbox_sender_acl(target, new_acl)
+                except Exception as exc:
+                    summary["errors"].append(f"sender_acl add {target}: {exc}")
+                    continue
+            summary["sender_acl_added"].append(target)
+            changed = True
+        elif (not want) and user_email in current_acl:
+            log.info("sender_acl DEL: %s on %s (dry_run=%s)",
+                     user_email, target, dry_run)
+            if not dry_run:
+                try:
+                    new_acl = sorted(current_acl - {user_email})
+                    mailcow.edit_mailbox_sender_acl(target, new_acl)
+                except Exception as exc:
+                    summary["errors"].append(f"sender_acl del {target}: {exc}")
+                    continue
+            summary["sender_acl_removed"].append(target)
+            changed = True
+
+        # --- Dovecot folder ACLs ---
+        if dovecot is None:
+            continue
+        try:
+            currently_has = dovecot.has_acl_for_user(target, user_email)
+        except Exception as exc:
+            summary["errors"].append(f"dovecot probe {target}: {exc}")
+            log.exception("dovecot has_acl_for_user(%s, %s) failed",
+                          target, user_email)
+            continue
+
+        if want and not currently_has:
+            log.info("dovecot GRANT: %s on %s (dry_run=%s)",
+                     user_email, target, dry_run)
+            if not dry_run:
+                try:
+                    dovecot.grant(target, user_email)
+                except Exception as exc:
+                    summary["errors"].append(f"dovecot grant {target}: {exc}")
+                    continue
+            summary["acl_granted"].append(target)
+            changed = True
+        elif (not want) and currently_has:
+            log.info("dovecot REVOKE: %s on %s (dry_run=%s)",
+                     user_email, target, dry_run)
+            if not dry_run:
+                try:
+                    dovecot.revoke(target, user_email)
+                except Exception as exc:
+                    summary["errors"].append(f"dovecot revoke {target}: {exc}")
+                    continue
+            summary["acl_revoked"].append(target)
+            changed = True
+
+    return changed
 
 
 def _add_target(

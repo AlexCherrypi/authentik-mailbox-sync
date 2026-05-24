@@ -17,6 +17,9 @@ from flask import Flask, jsonify, request
 
 from .auth import require_token
 from .mailcow.api import MailcowClient
+from .mailcow.db import MailcowDB
+from .mailcow.dovecot import DovecotClient
+from .mailcow.memcached import MemcachedClient
 from .nextcloud.occ import NextcloudClient
 from .reconcile import reconcile_user
 from .state import StateDB
@@ -38,6 +41,24 @@ mailcow = MailcowClient(
 nextcloud = NextcloudClient(
     container=os.environ.get("NEXTCLOUD_CONTAINER", "nextcloud"),
 )
+dovecot = DovecotClient(
+    container=os.environ.get("DOVECOT_CONTAINER", "dovecot-mailcow"),
+)
+memcached = MemcachedClient(
+    host=os.environ.get("MEMCACHED_HOST")
+         or os.environ.get("MEMCACHED_CONTAINER", "memcached-mailcow"),
+    port=int(os.environ.get("MEMCACHED_PORT", "11211")),
+)
+mailcow_db = None
+if all(os.environ.get(k) for k in ("MAILCOW_DB_HOST", "MAILCOW_DB_NAME",
+                                    "MAILCOW_DB_USER", "MAILCOW_DB_PASSWORD")):
+    mailcow_db = MailcowDB(
+        host=os.environ["MAILCOW_DB_HOST"],
+        user=os.environ["MAILCOW_DB_USER"],
+        password=os.environ["MAILCOW_DB_PASSWORD"],
+        database=os.environ["MAILCOW_DB_NAME"],
+        port=int(os.environ.get("MAILCOW_DB_PORT", "3306")),
+    )
 
 
 def _truthy(v: str) -> bool:
@@ -89,6 +110,9 @@ def reconcile():
             state=state,
             mailcow=mailcow,
             nextcloud=nextcloud,
+            dovecot=dovecot,
+            memcached=memcached,
+            mailcow_db=mailcow_db,
             our_domain=os.environ["OUR_DOMAIN"],
             imap_host=os.environ["IMAP_HOST"],
             imap_port=int(os.environ.get("IMAP_PORT", "993")),
