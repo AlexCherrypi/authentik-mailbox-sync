@@ -1,9 +1,14 @@
 """Authentik API client — read-only.
 
 Used by ``/reconcile-all`` to fetch the canonical user list together with the
-``shared_mailboxes`` attribute coming from each user's groups. One paginated
-API call per page covers user + all embedded group attributes (the
-``groups_obj`` field), so we don't issue per-user lookups.
+``shared_mailboxes`` attribute coming from each user's groups *and* the user's
+own ``attributes.shared_mailboxes`` (per-user override on top of group
+membership). One paginated API call per page covers user + all embedded group
+attributes (the ``groups_obj`` field), so we don't issue per-user lookups.
+
+This aggregation mirrors the OIDC scope mapping
+``aggregated shared_mailboxes for mailcow`` in Authentik, so both code paths
+expose the same set of mailboxes to a given user.
 
 Configuration (env vars used by ``app/webhook.py``):
     AUTHENTIK_API_URL   — e.g. ``https://auth.example.org/api/v3``
@@ -67,9 +72,10 @@ class AuthentikClient:
 
     def list_users_for_sync(self, our_domain: str) -> list[dict]:
         """Return one payload per Authentik user, in the same shape that
-        ``reconcile_user`` accepts. ``shared_mailboxes`` is the union over all
-        of the user's groups' ``attributes.shared_mailboxes`` (de-duped, with
-        the user's own primary email removed).
+        ``reconcile_user`` accepts. ``shared_mailboxes`` is the union of the
+        user's groups' ``attributes.shared_mailboxes`` and the user's own
+        ``attributes.shared_mailboxes`` (de-duped, with the user's own primary
+        email removed).
 
         Service-account user types are skipped — they don't have human
         mailboxes to reconcile."""
@@ -91,6 +97,9 @@ class AuthentikClient:
                 for mb in attrs.get("shared_mailboxes") or []:
                     if isinstance(mb, str):
                         mailboxes.add(mb)
+            for mb in (u.get("attributes") or {}).get("shared_mailboxes") or []:
+                if isinstance(mb, str):
+                    mailboxes.add(mb)
             mailboxes.discard(email)
 
             payloads.append({
