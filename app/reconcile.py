@@ -368,16 +368,22 @@ def _reconcile_sharing(
         if dovecot is None:
             continue
         try:
-            currently_has = dovecot.has_acl_for_user(target, user_email)
+            current_rights = dovecot.get_rights_for_user(target, user_email)
         except Exception as exc:
             summary["errors"].append(f"dovecot probe {target}: {exc}")
-            log.exception("dovecot has_acl_for_user(%s, %s) failed",
+            log.exception("dovecot get_rights_for_user(%s, %s) failed",
                           target, user_email)
             continue
 
-        if want and not currently_has:
-            log.info("dovecot GRANT: %s on %s (dry_run=%s)",
-                     user_email, target, dry_run)
+        # Grant when access is wanted and the current rights don't already
+        # cover the full desired set — this also *upgrades* a stale partial
+        # grant (e.g. an old lookup/read-only ACL) to the current DEFAULT_RIGHTS
+        # instead of skipping it as "already present".
+        desired_rights = set(dovecot.default_rights)
+        if want and not desired_rights.issubset(current_rights):
+            log.info("dovecot GRANT: %s on %s have=%s want=%s (dry_run=%s)",
+                     user_email, target, sorted(current_rights),
+                     sorted(desired_rights), dry_run)
             if not dry_run:
                 try:
                     dovecot.grant(target, user_email)
@@ -386,7 +392,7 @@ def _reconcile_sharing(
                     continue
             summary["acl_granted"].append(target)
             changed = True
-        elif (not want) and currently_has:
+        elif (not want) and current_rights:
             log.info("dovecot REVOKE: %s on %s (dry_run=%s)",
                      user_email, target, dry_run)
             if not dry_run:
