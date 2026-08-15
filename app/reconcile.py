@@ -111,6 +111,7 @@ def reconcile_user(
     memcached=None,
     mailcow_db=None,
     sogo=None,
+    nc_maildb=None,
     our_domain: str,
     imap_host: str,
     imap_port: int,
@@ -118,6 +119,10 @@ def reconcile_user(
     smtp_host: str,
     smtp_port: int,
     smtp_enc: str,
+    sieve_provisioning: bool = False,
+    sieve_host: str = "",
+    sieve_port: int = 4190,
+    sieve_ssl_mode: str = "tls",
     dry_run: bool = False,
 ) -> dict:
     """Reconcile one user's mailbox claims against Mailcow + Nextcloud.
@@ -153,6 +158,7 @@ def reconcile_user(
         "sogo_delegate_from_set": False,
         "sogo_delegate_to_added": [],
         "sogo_delegate_to_removed": [],
+        "nc_sieve_provisioned": [],
         "memcached_flushed": False,
         "errors": [],
     }
@@ -238,6 +244,26 @@ def reconcile_user(
             except Exception as exc:
                 summary["errors"].append(f"remove {target}: {exc}")
                 log.exception("remove %s for user %s failed", target, user_email)
+
+        # Nextcloud Mail DB provisioning (Sieve settings) for every managed
+        # target that currently has an NC mail account — i.e. the actionable
+        # targets minus the ones we just removed. Gated on
+        # ``sieve_provisioning`` so a deploy before the ManageSieve port is
+        # opened is a strict no-op. Per-target failures are logged and never
+        # abort the overall reconcile (same pattern as the other steps).
+        if nc_maildb is not None and sieve_provisioning:
+            nc_targets = (
+                (current_targets | set(summary["added"]))
+                - set(summary["removed"])
+            ) & actionable
+            for target in sorted(nc_targets):
+                _provision_nc_maildb(
+                    user_email, target,
+                    nc_maildb=nc_maildb,
+                    sieve_host=sieve_host, sieve_port=sieve_port,
+                    sieve_ssl_mode=sieve_ssl_mode,
+                    dry_run=dry_run, summary=summary,
+                )
 
         # Sharing-side reconcile (sender_acl + Dovecot ACL) — independent of
         # app-pwd lifecycle. desired_shared excludes the user's own mailbox.
@@ -432,6 +458,45 @@ def _reconcile_sharing(
             changed = True
 
     return changed
+
+
+def _provision_nc_maildb(
+    user_email: str,
+    target: str,
+    *,
+    nc_maildb,
+    sieve_host: str,
+    sieve_port: int,
+    sieve_ssl_mode: str,
+    dry_run: bool,
+    summary: dict,
+) -> None:
+    """Provision the Nextcloud Mail DB side for one (user, target) account:
+    set the ManageSieve coordinates. Determines the NC account id itself from
+    (user_email, target); if there is no NC mail account yet, the step is
+    skipped. Failures are isolated so they never abort the wider reconcile."""
+    try:
+        account_id = nc_maildb.get_account_id(user_email, target)
+    except Exception as exc:
+        summary["errors"].append(f"nc_maildb account lookup {target}: {exc}")
+        log.exception("nc_maildb.get_account_id(%s, %s) failed", user_email, target)
+        return
+    if account_id is None:
+        log.info("nc_maildb: no NC mail account for user=%s target=%s — "
+                 "skipping sieve/mapping", user_email, target)
+        return
+
+    # Feature 2 — Sieve settings
+    try:
+        if nc_maildb.ensure_sieve_settings(
+            account_id, host=sieve_host, port=sieve_port,
+            ssl_mode=sieve_ssl_mode, dry_run=dry_run,
+        ):
+            summary["nc_sieve_provisioned"].append(target)
+    except Exception as exc:
+        summary["errors"].append(f"nc_maildb sieve {target}: {exc}")
+        log.exception("nc_maildb.ensure_sieve_settings for %s/%s failed",
+                      user_email, target)
 
 
 def _add_target(
