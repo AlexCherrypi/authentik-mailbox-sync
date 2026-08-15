@@ -123,9 +123,18 @@ def reconcile_user(
     sieve_host: str = "",
     sieve_port: int = 4190,
     sieve_ssl_mode: str = "tls",
+    self_entry_seen: Optional[set] = None,
     dry_run: bool = False,
 ) -> dict:
     """Reconcile one user's mailbox claims against Mailcow + Nextcloud.
+
+    ``self_entry_seen`` is an optional set the *sweep* passes in and shares
+    across every user of one run: the Dovecot self-entry guard is per-mailbox
+    and independent of which user triggers it, so once a mailbox has been
+    probed this run its name is recorded here and later users skip it. This
+    keeps a full sweep O(mailboxes) instead of O(users × mailboxes). Left at
+    ``None`` for one-off calls (each gets a fresh set → every mailbox probed
+    once).
 
     Payload keys (we accept the union of the historical formats):
         - email          (required) — canonical user identifier
@@ -277,6 +286,7 @@ def reconcile_user(
             mailcow=mailcow, mailcow_db=mailcow_db, dovecot=dovecot,
             sogo=sogo,
             our_domain=our_domain, dry_run=dry_run,
+            self_entry_seen=self_entry_seen,
             summary=summary,
         )
 
@@ -302,6 +312,7 @@ def _reconcile_sharing(
     our_domain: str,
     dry_run: bool,
     summary: dict,
+    self_entry_seen: Optional[set] = None,
 ) -> bool:
     """Walk every LKS-domain mailbox (except the user's own) and bring its
     ``sender_acl`` + Dovecot ACLs into agreement with *desired_shared* for the
@@ -312,6 +323,10 @@ def _reconcile_sharing(
     Returns True if anything actually changed (used to decide if memcached
     needs flushing)."""
     changed = False
+    # Per-run dedup for the self-entry guard (see reconcile_user docstring). A
+    # standalone call gets its own set, so every mailbox is still probed once.
+    if self_entry_seen is None:
+        self_entry_seen = set()
 
     # Read current sender_acl rows once (mailcow REST has no read endpoint, so
     # we hit the DB directly). Skip sender_acl handling entirely if no DB
@@ -439,18 +454,22 @@ def _reconcile_sharing(
         # artefact — AMS never creates it) can silently flip the mailbox
         # read-only. Remove any found on this target regardless of ``want``.
         # Isolated like every other step: a failure is recorded and never
-        # aborts the reconcile.
-        try:
-            self_removed = dovecot.remove_self_entries(target, dry_run=dry_run)
-        except Exception as exc:
-            summary["errors"].append(f"dovecot self-entry {target}: {exc}")
-            log.exception("dovecot.remove_self_entries(%s) failed", target)
-        else:
-            if self_removed:
-                log.info("dovecot removed %d self-entry folder(s) on %s (dry_run=%s)",
-                         len(self_removed), target, dry_run)
-                summary["acl_self_entries_removed"].append(target)
-                changed = True
+        # aborts the reconcile. Deduped across the run so a sweep probes each
+        # mailbox once (add to seen *before* the call so a slow/failing probe
+        # isn't retried per user; a fresh set next run retries it).
+        if target not in self_entry_seen:
+            self_entry_seen.add(target)
+            try:
+                self_removed = dovecot.remove_self_entries(target, dry_run=dry_run)
+            except Exception as exc:
+                summary["errors"].append(f"dovecot self-entry {target}: {exc}")
+                log.exception("dovecot.remove_self_entries(%s) failed", target)
+            else:
+                if self_removed:
+                    log.info("dovecot removed %d self-entry folder(s) on %s "
+                             "(dry_run=%s)", len(self_removed), target, dry_run)
+                    summary["acl_self_entries_removed"].append(target)
+                    changed = True
 
         # --- SOGo Mail.DelegateTo on the shared mailbox's profile ---
         if sogo is None:

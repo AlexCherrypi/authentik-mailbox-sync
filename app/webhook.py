@@ -126,7 +126,8 @@ def healthz():
     return jsonify(out), code
 
 
-def _reconcile_one(user_payload: dict, dry_run: bool) -> dict:
+def _reconcile_one(user_payload: dict, dry_run: bool,
+                   self_entry_seen: set | None = None) -> dict:
     return reconcile_user(
         user_payload,
         state=state,
@@ -137,6 +138,7 @@ def _reconcile_one(user_payload: dict, dry_run: bool) -> dict:
         mailcow_db=mailcow_db,
         sogo=sogo,
         nc_maildb=nc_maildb,
+        self_entry_seen=self_entry_seen,
         our_domain=os.environ["OUR_DOMAIN"],
         imap_host=os.environ["IMAP_HOST"],
         imap_port=int(os.environ.get("IMAP_PORT", "993")),
@@ -165,12 +167,13 @@ def reconcile():
         users = payload["users_to_reconcile"]
         log.info("reconcile multi-user count=%d dry_run=%s", len(users), dry_run)
         results = []
+        self_entry_seen: set[str] = set()  # dedup guard across this batch
         for u in users:
             if not isinstance(u, dict):
                 results.append({"error": "invalid user payload", "payload": u})
                 continue
             try:
-                results.append(_reconcile_one(u, dry_run))
+                results.append(_reconcile_one(u, dry_run, self_entry_seen))
             except Exception as exc:
                 log.exception("reconcile crashed for user=%s", u.get("email"))
                 results.append({"error": str(exc), "user_email": u.get("email")})
@@ -216,10 +219,14 @@ def reconcile_all():
     known_emails = set(state.known_users())
     orphan_emails = sorted(known_emails - authentik_emails)
 
+    # One shared set for the whole sweep so the Dovecot self-entry guard probes
+    # each mailbox once, not once per user (keeps the sweep O(mailboxes)).
+    self_entry_seen: set[str] = set()
+
     results = []
     for payload in authentik_payloads:
         try:
-            results.append(_reconcile_one(payload, dry_run))
+            results.append(_reconcile_one(payload, dry_run, self_entry_seen))
         except Exception as exc:
             log.exception("reconcile-all crashed for user=%s", payload.get("email"))
             results.append({"error": str(exc), "user_email": payload.get("email")})
@@ -237,7 +244,7 @@ def reconcile_all():
             "additional_emails": [],
         }
         try:
-            gc_results.append(_reconcile_one(gc_payload, dry_run))
+            gc_results.append(_reconcile_one(gc_payload, dry_run, self_entry_seen))
         except Exception as exc:
             log.exception("reconcile-all GC crashed for user=%s", email)
             gc_results.append({"error": str(exc), "user_email": email})
