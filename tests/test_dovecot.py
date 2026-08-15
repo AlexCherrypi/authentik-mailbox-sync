@@ -199,3 +199,123 @@ def test_revoke_builds_delete_and_tolerates_not_found(monkeypatch):
     monkeypatch.setattr(c, "_exec", exec_)
     # must not raise despite non-zero rc (not-found is tolerated)
     c.revoke("mb@lammers-krueger.de", "u@lammers-krueger.de")
+
+
+# ---- self-entry guard: remove_self_entries ---------------------------------
+
+MB = "webmaster@lammers-krueger.de"
+
+
+class _AclExec:
+    """Stub that distinguishes ``acl get`` from ``acl delete`` (the shared
+    _StubExec keys only on args[0]=="acl"). ``get_stdout`` maps a folder name to
+    the ``acl get`` output for that folder; anything not listed yields an empty
+    grant. Records every delete so the test can assert exactly which folders
+    were touched."""
+
+    def __init__(self, folders, get_stdout, get_raises=()):
+        self._listing = "\n".join(folders)
+        self._get_stdout = get_stdout
+        self._get_raises = set(get_raises)
+        self.deletes = []
+
+    def __call__(self, *args, check=True):
+        if args[0] == "mailbox":
+            return _cp(stdout=self._listing)
+        if args[0] == "acl" and args[1] == "get":
+            folder = args[4]  # ["acl","get","-u",<mb>,<folder>]
+            if folder in self._get_raises:
+                from app.mailcow.dovecot import DovecotError
+                raise DovecotError(f"acl get boom on {folder}")
+            return _cp(stdout=self._get_stdout.get(folder, ""))
+        if args[0] == "acl" and args[1] == "delete":
+            self.deletes.append(list(args))
+            return _cp()
+        return _cp()
+
+
+def _self_row(mb):
+    return f"user={mb}   lookup read write write-seen"
+
+
+def test_remove_self_entries_deletes_only_where_present(monkeypatch):
+    # Self-entry on INBOX + Sent, but not on Drafts.
+    c = DovecotClient(container="dovecot-test")
+    stub = _AclExec(
+        folders=["INBOX", "Sent", "Drafts"],
+        get_stdout={"INBOX": _self_row(MB), "Sent": _self_row(MB),
+                    "Drafts": "anyone   lookup read"},
+    )
+    monkeypatch.setattr(c, "_exec", stub)
+
+    removed = c.remove_self_entries(MB)
+
+    assert removed == ["INBOX", "Sent"]
+    deleted_folders = [d[4] for d in stub.deletes]
+    assert deleted_folders == ["INBOX", "Sent"]
+    for d in stub.deletes:
+        assert d == ["acl", "delete", "-u", MB, d[4], f"user={MB}"]
+
+
+def test_remove_self_entries_no_entry_is_noop(monkeypatch):
+    c = DovecotClient(container="dovecot-test")
+    stub = _AclExec(
+        folders=["INBOX", "Sent"],
+        get_stdout={"INBOX": "anyone   lookup read",
+                    "Sent": "user=cloud@lammers-krueger.de   lookup read"},
+    )
+    monkeypatch.setattr(c, "_exec", stub)
+
+    removed = c.remove_self_entries(MB)
+
+    assert removed == []
+    assert stub.deletes == []  # never a blind delete
+
+
+def test_remove_self_entries_dry_run_probes_but_never_deletes(monkeypatch):
+    c = DovecotClient(container="dovecot-test")
+    stub = _AclExec(
+        folders=["INBOX", "Sent"],
+        get_stdout={"INBOX": _self_row(MB), "Sent": _self_row(MB)},
+    )
+    monkeypatch.setattr(c, "_exec", stub)
+
+    removed = c.remove_self_entries(MB, dry_run=True)
+
+    # reports what it *would* remove, but issues no delete
+    assert removed == ["INBOX", "Sent"]
+    assert stub.deletes == []
+
+
+def test_remove_self_entries_probe_failure_is_logged_not_fatal(monkeypatch, caplog):
+    # acl get on Sent blows up; INBOX still gets cleaned, walk not aborted.
+    c = DovecotClient(container="dovecot-test")
+    stub = _AclExec(
+        folders=["INBOX", "Sent", "Drafts"],
+        get_stdout={"INBOX": _self_row(MB), "Drafts": _self_row(MB)},
+        get_raises={"Sent"},
+    )
+    monkeypatch.setattr(c, "_exec", stub)
+
+    with caplog.at_level("WARNING"):
+        removed = c.remove_self_entries(MB)
+
+    assert removed == ["INBOX", "Drafts"]          # Sent skipped, not aborted
+    assert [d[4] for d in stub.deletes] == ["INBOX", "Drafts"]
+    assert "self-probe" in caplog.text
+
+
+def test_remove_self_entries_skips_shared_namespace(monkeypatch):
+    # A mailbox that is itself a sharee lists Shared/… folders; those must not
+    # be probed/deleted (list_folders already filters them, guarded here too).
+    c = DovecotClient(container="dovecot-test")
+    stub = _AclExec(
+        folders=["INBOX", "Shared/other@lammers-krueger.de"],
+        get_stdout={"INBOX": _self_row(MB)},
+    )
+    monkeypatch.setattr(c, "_exec", stub)
+
+    removed = c.remove_self_entries(MB)
+
+    assert removed == ["INBOX"]
+    assert [d[4] for d in stub.deletes] == ["INBOX"]

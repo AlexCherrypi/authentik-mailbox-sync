@@ -155,6 +155,7 @@ def reconcile_user(
         "sender_acl_removed": [],
         "acl_granted": [],
         "acl_revoked": [],
+        "acl_self_entries_removed": [],
         "sogo_delegate_from_set": False,
         "sogo_delegate_to_added": [],
         "sogo_delegate_to_removed": [],
@@ -431,6 +432,25 @@ def _reconcile_sharing(
                     continue
             summary["acl_revoked"].append(target)
             changed = True
+
+        # --- Self-entry cleanup (defensive, independent of sharing intent) ---
+        # A ``user=<owner>`` ACL on the owner's OWN mailbox is always wrong: the
+        # owner has implicit access anyway, and such a stale row (an old-import
+        # artefact — AMS never creates it) can silently flip the mailbox
+        # read-only. Remove any found on this target regardless of ``want``.
+        # Isolated like every other step: a failure is recorded and never
+        # aborts the reconcile.
+        try:
+            self_removed = dovecot.remove_self_entries(target, dry_run=dry_run)
+        except Exception as exc:
+            summary["errors"].append(f"dovecot self-entry {target}: {exc}")
+            log.exception("dovecot.remove_self_entries(%s) failed", target)
+        else:
+            if self_removed:
+                log.info("dovecot removed %d self-entry folder(s) on %s (dry_run=%s)",
+                         len(self_removed), target, dry_run)
+                summary["acl_self_entries_removed"].append(target)
+                changed = True
 
         # --- SOGo Mail.DelegateTo on the shared mailbox's profile ---
         if sogo is None:
