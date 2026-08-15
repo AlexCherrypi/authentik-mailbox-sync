@@ -108,6 +108,24 @@ class DovecotClient:
         """Coarse check: does *user* have *any* ACL on the mailbox INBOX?"""
         return bool(self.get_rights_for_user(mailbox, user))
 
+    def _has_self_entry(self, mailbox: str, folder: str) -> bool:
+        """True if *folder* of *mailbox* carries an ACL row for the mailbox's
+        own owner (``user=<mailbox>``).
+
+        Raises :class:`DovecotError` if the ``acl get`` probe itself fails — the
+        caller treats that as "can't tell, skip this folder" and logs it, rather
+        than assuming a self-entry is absent."""
+        proc = self._exec("acl", "get", "-u", mailbox, folder)  # check=True
+        needle = f"user={mailbox}"
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            # Same row shape as get_rights_for_user: the ID column is the first
+            # token, so an exact match on "user=<mailbox>" avoids substring
+            # false-positives (e.g. user=cloud2@ vs user=cloud@).
+            if parts and parts[0] == needle:
+                return True
+        return False
+
     # ---- ACL writes ------------------------------------------------------
 
     def grant(self, mailbox: str, user: str,
@@ -138,3 +156,48 @@ class DovecotClient:
                     continue
                 log.warning("doveadm acl delete failed for %s/%s user=%s: %s",
                             mailbox, folder, user, stderr[:200])
+
+    def remove_self_entries(self, mailbox: str, dry_run: bool = False) -> list[str]:
+        """Detect and remove *self-entries* — an ACL granting the mailbox owner
+        rights on their *own* mailbox (``user=<mailbox>`` on a folder of
+        ``<mailbox>``).
+
+        Such an entry is always wrong: the owner already has implicit full
+        access, and a stale ``user=<owner>`` row (an old-import artefact that
+        this service never creates) can silently flip the mailbox read-only.
+        So any that exist are removed.
+
+        Idempotent and non-blind: each folder is probed with ``acl get`` first
+        and ``acl delete`` only fires where a self-entry is actually present.
+        A probe that fails is logged and skipped (never aborts the walk), and a
+        delete's "no such ACL" exit is tolerated like in :meth:`revoke`.
+
+        Returns the list of folders a self-entry was found on. In dry-run mode
+        nothing is deleted but the same list is returned, so the caller can
+        surface what *would* be removed (consistent with the other steps)."""
+        removed: list[str] = []
+        for folder in self.list_folders(mailbox):
+            try:
+                present = self._has_self_entry(mailbox, folder)
+            except DovecotError as exc:
+                log.warning("doveadm acl get (self-probe) failed for %s/%s: %s",
+                            mailbox, folder, exc)
+                continue
+            if not present:
+                continue
+            log.info("dovecot SELF-ENTRY on %s/%s — removing (dry_run=%s)",
+                     mailbox, folder, dry_run)
+            if not dry_run:
+                args = ["acl", "delete", "-u", mailbox, folder,
+                        f"user={mailbox}"]
+                proc = self._exec(*args, check=False)
+                if proc.returncode != 0:
+                    stderr = proc.stderr.strip()
+                    # not-found is acceptable (someone else removed it first)
+                    if not ("no such" in stderr.lower()
+                            or "not found" in stderr.lower()):
+                        log.warning("doveadm acl delete (self) failed for "
+                                    "%s/%s: %s", mailbox, folder, stderr[:200])
+                        continue
+            removed.append(folder)
+        return removed

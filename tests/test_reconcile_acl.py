@@ -14,11 +14,14 @@ DOMAIN = "lammers-krueger.de"
 
 
 class FakeDovecot:
-    def __init__(self, current_rights):
+    def __init__(self, current_rights, self_entry_targets=()):
         self.default_rights = tuple(DEFAULT_RIGHTS)
         self._current = set(current_rights)
         self.granted = []
         self.revoked = []
+        # Targets on which remove_self_entries should report a removal.
+        self._self_entry_targets = set(self_entry_targets)
+        self.self_entry_calls = []
 
     def get_rights_for_user(self, target, user):
         return set(self._current)
@@ -28,6 +31,12 @@ class FakeDovecot:
 
     def revoke(self, target, user):
         self.revoked.append((target, user))
+
+    def remove_self_entries(self, mailbox, dry_run=False):
+        self.self_entry_calls.append((mailbox, dry_run))
+        if mailbox in self._self_entry_targets:
+            return ["INBOX"]
+        return []
 
 
 class FakeMailcow:
@@ -45,14 +54,15 @@ def _blank_summary():
         "sender_acl_removed": [],
         "acl_granted": [],
         "acl_revoked": [],
+        "acl_self_entries_removed": [],
         "sogo_delegate_from_set": False,
         "sogo_delegate_to_added": [],
         "sogo_delegate_to_removed": [],
     }
 
 
-def _run(current_rights, want):
-    dov = FakeDovecot(current_rights)
+def _run(current_rights, want, self_entry_targets=()):
+    dov = FakeDovecot(current_rights, self_entry_targets=self_entry_targets)
     summary = _blank_summary()
     _reconcile_sharing(
         USER,
@@ -95,3 +105,22 @@ def test_no_acl_and_not_wanted_is_noop():
     dov, summary = _run(current_rights=set(), want=False)
     assert dov.granted == []
     assert dov.revoked == []
+
+
+# ---- self-entry guard wiring ----------------------------------------------
+
+def test_self_entry_guard_runs_regardless_of_sharing_intent():
+    # Even with no sharing wanted, the guard still probes the target mailbox.
+    dov, summary = _run(current_rights=set(), want=False)
+    assert dov.self_entry_calls == [(TARGET, False)]
+
+
+def test_self_entry_removal_lands_in_summary():
+    dov, summary = _run(current_rights=set(DEFAULT_RIGHTS), want=True,
+                        self_entry_targets={TARGET})
+    assert summary["acl_self_entries_removed"] == [TARGET]
+
+
+def test_no_self_entry_leaves_summary_empty():
+    dov, summary = _run(current_rights=set(DEFAULT_RIGHTS), want=True)
+    assert summary["acl_self_entries_removed"] == []

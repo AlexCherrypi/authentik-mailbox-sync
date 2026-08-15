@@ -23,7 +23,7 @@ service computes the desired state from group attributes and applies it:
 |----------------------|--------------------------------------------------------------------------|
 | Mailcow API          | maintain `sender_acl` of every shared mailbox (add + remove symmetrically)|
 | Mailcow App-Passwords| create with deterministic name `authentik-sync:<user>:<target>`, delete when no longer needed |
-| Dovecot ACLs         | `doveadm acl set` / `delete` on shared mailbox folders for the user      |
+| Dovecot ACLs         | `doveadm acl set` / `delete` on shared mailbox folders for the user; plus a defensive **self-entry guard** that removes any stray `user=<owner>` ACL on the owner's own mailbox |
 | SOGo settings        | `Mail.DelegateFrom` / `DelegateTo` / `OtherUsersFolders` in `sogo_user_profile.c_settings` |
 | Nextcloud Mail       | `occ mail:account:create` / `delete` with the App-Password from above    |
 | Nextcloud Mail (Sieve)| set ManageSieve coordinates on each managed account (`oc_mail_accounts`) so server-side filters work — opt-in via `SIEVE_PROVISIONING` |
@@ -66,6 +66,18 @@ SOGo HTTP API that landed in 5.12.2 only has two endpoints (version + DAV
 URLs) — no user-preferences. So the service writes `c_settings` directly,
 with `SELECT … FOR UPDATE`, JSON read-modify-write, then a memcached flush so
 SOGo picks up the change immediately.
+
+## Dovecot ACL self-entry guard
+
+During the sharing reconcile the service also removes any **self-entry** it
+finds — a `user=<owner>` ACL row sitting on a folder of that same owner's
+mailbox. Such an entry is always wrong: the owner already has implicit full
+access, and a stale `user=<owner>` row (an old-import artefact — the service
+never creates one) can silently flip the mailbox into read-only. For every
+managed target the guard probes each folder with `doveadm acl get` first and
+only issues `doveadm acl delete user=<owner>` where a self-entry actually
+exists (idempotent, never a blind delete, dry-run aware). Removals surface in
+the reconcile summary as `acl_self_entries_removed`.
 
 ## Nextcloud Mail: Sieve + folder-mapping provisioning
 
