@@ -25,6 +25,7 @@ from .mailcow.db import MailcowDB
 from .mailcow.dovecot import DovecotClient
 from .mailcow.memcached import MemcachedClient
 from .nextcloud.occ import NextcloudClient
+from .nextcloud.sieve import NextcloudMailDB
 from .reconcile import reconcile_user
 from .sogo.prefs import SogoPrefs
 from .state import StateDB
@@ -45,6 +46,11 @@ mailcow = MailcowClient(
 )
 nextcloud = NextcloudClient(
     container=os.environ.get("NEXTCLOUD_CONTAINER", "nextcloud"),
+)
+nc_maildb = NextcloudMailDB(
+    container=os.environ.get("NC_DB_CONTAINER", "nextcloud-aio-database"),
+    db_name=os.environ.get("NC_DB_NAME", "nextcloud_database"),
+    db_user=os.environ.get("NC_DB_USER", "nextcloud"),
 )
 dovecot = DovecotClient(
     container=os.environ.get("DOVECOT_CONTAINER", "dovecot-mailcow"),
@@ -130,6 +136,7 @@ def _reconcile_one(user_payload: dict, dry_run: bool) -> dict:
         memcached=memcached,
         mailcow_db=mailcow_db,
         sogo=sogo,
+        nc_maildb=nc_maildb,
         our_domain=os.environ["OUR_DOMAIN"],
         imap_host=os.environ["IMAP_HOST"],
         imap_port=int(os.environ.get("IMAP_PORT", "993")),
@@ -137,6 +144,10 @@ def _reconcile_one(user_payload: dict, dry_run: bool) -> dict:
         smtp_host=os.environ["SMTP_HOST"],
         smtp_port=int(os.environ.get("SMTP_PORT", "465")),
         smtp_enc=os.environ.get("SMTP_ENCRYPTION", "ssl"),
+        sieve_provisioning=_truthy(os.environ.get("SIEVE_PROVISIONING", "")),
+        sieve_host=os.environ.get("SIEVE_HOST") or os.environ.get("IMAP_HOST", ""),
+        sieve_port=int(os.environ.get("SIEVE_PORT", "4190")),
+        sieve_ssl_mode=os.environ.get("SIEVE_SSL_MODE", "tls"),
         dry_run=dry_run,
     )
 

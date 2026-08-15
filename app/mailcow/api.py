@@ -63,13 +63,19 @@ class MailcowClient:
         mailbox: str,
         app_name: str,
         password: str,
-        protocols: Iterable[str] = ("imap_access", "smtp_access"),
+        protocols: Iterable[str] = ("imap_access", "smtp_access", "sieve_access"),
     ) -> int:
         """Create an app password and return its numeric id.
 
         Mailcow's POST response wraps the new id in ``log.id`` but the schema
         varies across versions, so we list-and-find after the create as the
-        reliable path."""
+        reliable path.
+
+        ``sieve_access`` is granted by default so the same App-Password also
+        authenticates ManageSieve (port 4190) logins — Dovecot's Lua auth
+        checks the ``app_passwd.sieve_access`` column on managesieve, so a
+        Nextcloud Mail account that manages server-side filters can reuse the
+        very password we provision here instead of needing separate creds."""
         payload = {
             "active": "1",
             "username": mailbox,
