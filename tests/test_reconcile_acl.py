@@ -124,3 +124,22 @@ def test_self_entry_removal_lands_in_summary():
 def test_no_self_entry_leaves_summary_empty():
     dov, summary = _run(current_rights=set(DEFAULT_RIGHTS), want=True)
     assert summary["acl_self_entries_removed"] == []
+
+
+def test_self_entry_guard_deduped_across_a_shared_set():
+    # Simulate two users of one sweep sharing a self_entry_seen set: the same
+    # target mailbox must be probed exactly once total, not once per user.
+    dov = FakeDovecot(set(DEFAULT_RIGHTS))
+    seen: set[str] = set()
+    mailboxes = [{"username": USER}, {"username": TARGET}]
+    for user in ("a@lammers-krueger.de", "b@lammers-krueger.de"):
+        _reconcile_sharing(
+            user, set(),
+            all_mailboxes=mailboxes,
+            mailcow=FakeMailcow(), mailcow_db=None, dovecot=dov, sogo=None,
+            our_domain=DOMAIN, dry_run=False, summary=_blank_summary(),
+            self_entry_seen=seen,
+        )
+    # USER + TARGET each probed once across both runs (never per-user).
+    probed = [mb for mb, _ in dov.self_entry_calls]
+    assert sorted(probed) == sorted([USER, TARGET])
