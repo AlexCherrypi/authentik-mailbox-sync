@@ -24,6 +24,14 @@ log = logging.getLogger("sync.reconcile")
 
 MARKER_PREFIX = "authentik-sync:"
 
+# Disjoint prefix for Thunderbird-setup App-Passwords (T-009d). MUST stay
+# distinct from MARKER_PREFIX: ``adopt_from_markers`` only ever matches names
+# starting with ``authentik-sync:<user>:`` and the authentik-sync remove path
+# only deletes state-tracked ids, so a ``tb-setup:*`` password is never pulled
+# into — nor torn down by — the authentik-sync lifecycle. This is the hard
+# invariant tested in tests/test_tb_sweep_cleanup.py.
+TB_MARKER_PREFIX = "tb-setup:"
+
 
 def _generate_password() -> str:
     """Random 20-byte URL-safe token. Reroll if it would start with ``-``
@@ -36,6 +44,14 @@ def _generate_password() -> str:
 
 def _marker_for(user_email: str, target_email: str) -> str:
     return f"{MARKER_PREFIX}{user_email}:{target_email}"
+
+
+def tb_marker_for(user_email: str, target_email: str, device: str) -> str:
+    """App-Password name for a Thunderbird-setup credential (T-009d).
+
+    Shape: ``tb-setup:<user>:<target>:<device>``. Never uses MARKER_PREFIX —
+    see the note on TB_MARKER_PREFIX."""
+    return f"{TB_MARKER_PREFIX}{user_email}:{target_email}:{device}"
 
 
 def _looks_like_our_marker(name: str, user_email: str) -> Optional[str]:
@@ -123,6 +139,7 @@ def reconcile_user(
     sieve_host: str = "",
     sieve_port: int = 4190,
     sieve_ssl_mode: str = "tls",
+    tb_setup_cleanup: bool = False,
     self_entry_seen: Optional[set] = None,
     dry_run: bool = False,
 ) -> dict:
@@ -135,6 +152,10 @@ def reconcile_user(
     keeps a full sweep O(mailboxes) instead of O(users × mailboxes). Left at
     ``None`` for one-off calls (each gets a fresh set → every mailbox probed
     once).
+
+    ``tb_setup_cleanup`` (T-009d) turns on revocation of Thunderbird-setup
+    App-Passwords whose entitlement was withdrawn. Default off so a deploy with
+    the ``/my-accounts`` endpoint still disabled never touches ``tb_setup_pwds``.
 
     Payload keys (we accept the union of the historical formats):
         - email          (required) — canonical user identifier
@@ -170,6 +191,7 @@ def reconcile_user(
         "sogo_delegate_to_removed": [],
         "nc_sieve_provisioned": [],
         "nc_mapping_enforced": [],
+        "tb_setup_removed": [],
         "memcached_flushed": False,
         "errors": [],
     }
@@ -290,6 +312,19 @@ def reconcile_user(
             summary=summary,
         )
 
+        # tb-setup (T-009d) revocation: drop any Thunderbird-setup App-Password
+        # whose (user, target) entitlement is no longer actionable. Runs AFTER
+        # the authentik-sync add/remove above and only touches the separate
+        # tb_setup_pwds table, so the two lifecycles never cross. Gated so a
+        # deploy with the /my-accounts endpoint still disabled is a strict
+        # no-op for these rows. For a fully orphaned user (own mailbox also
+        # gone) ``actionable`` is empty, so ALL their tb-setup passwords fall.
+        if tb_setup_cleanup:
+            _cleanup_tb_setup(
+                user_email, actionable,
+                state=state, mailcow=mailcow, dry_run=dry_run, summary=summary,
+            )
+
         if memcached is not None and sharing_changed and not dry_run:
             if memcached.flush_all():
                 summary["memcached_flushed"] = True
@@ -298,6 +333,52 @@ def reconcile_user(
             state.touch_user(user_email)
 
     return summary
+
+
+def _cleanup_tb_setup(
+    user_email: str,
+    actionable: set[str],
+    *,
+    state: StateDB,
+    mailcow,
+    dry_run: bool,
+    summary: dict,
+) -> None:
+    """Delete tb-setup App-Passwords for *user_email* whose target mailbox is no
+    longer in *actionable* (entitlement revoked, D-005). All devices for a
+    revoked target fall. Only ever touches ``tb_setup_pwds`` + the Mailcow
+    app-password ids it recorded there — never authentik-sync rows."""
+    try:
+        rows = state.tb_get_for_user(user_email)
+    except Exception as exc:
+        summary["errors"].append(f"tb_setup list {user_email}: {exc}")
+        log.exception("tb_setup: list rows for %s failed", user_email)
+        return
+
+    for row in rows:
+        if row.target_email in actionable:
+            continue
+        log.info("tb_setup REVOKE user=%s target=%s device=%s dry_run=%s",
+                 user_email, row.target_email, row.device, dry_run)
+        entry = f"{row.target_email}:{row.device}"
+        if dry_run:
+            summary["tb_setup_removed"].append(entry)
+            continue
+        if row.mailcow_app_pwd_id is not None:
+            try:
+                mailcow.delete_app_passwd([row.mailcow_app_pwd_id])
+            except Exception as exc:
+                summary["errors"].append(f"tb_setup delete pwd {entry}: {exc}")
+                log.exception("tb_setup: delete_app_passwd(%s) failed",
+                              row.mailcow_app_pwd_id)
+                continue
+        try:
+            state.tb_delete(user_email, row.target_email, row.device)
+        except Exception as exc:
+            summary["errors"].append(f"tb_setup state delete {entry}: {exc}")
+            log.exception("tb_setup: tb_delete(%s) failed", entry)
+            continue
+        summary["tb_setup_removed"].append(entry)
 
 
 def _reconcile_sharing(
