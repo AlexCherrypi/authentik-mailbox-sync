@@ -159,6 +159,7 @@ def reconcile_user(
         "sogo_delegate_to_added": [],
         "sogo_delegate_to_removed": [],
         "nc_sieve_provisioned": [],
+        "nc_mapping_enforced": [],
         "memcached_flushed": False,
         "errors": [],
     }
@@ -245,12 +246,13 @@ def reconcile_user(
                 summary["errors"].append(f"remove {target}: {exc}")
                 log.exception("remove %s for user %s failed", target, user_email)
 
-        # Nextcloud Mail DB provisioning (Sieve settings) for every managed
-        # target that currently has an NC mail account — i.e. the actionable
-        # targets minus the ones we just removed. Gated on
-        # ``sieve_provisioning`` so a deploy before the ManageSieve port is
-        # opened is a strict no-op. Per-target failures are logged and never
-        # abort the overall reconcile (same pattern as the other steps).
+        # Nextcloud Mail DB provisioning (Sieve settings + special-folder
+        # mapping enforcement) for every managed target that currently has an
+        # NC mail account — i.e. the actionable targets minus the ones we just
+        # removed. Gated on ``sieve_provisioning`` so a deploy before the
+        # ManageSieve port is opened is a strict no-op. Per-target failures are
+        # logged and never abort the overall reconcile (same pattern as the
+        # other steps).
         if nc_maildb is not None and sieve_provisioning:
             nc_targets = (
                 (current_targets | set(summary["added"]))
@@ -472,9 +474,11 @@ def _provision_nc_maildb(
     summary: dict,
 ) -> None:
     """Provision the Nextcloud Mail DB side for one (user, target) account:
-    set the ManageSieve coordinates. Determines the NC account id itself from
-    (user_email, target); if there is no NC mail account yet, the step is
-    skipped. Failures are isolated so they never abort the wider reconcile."""
+    set the ManageSieve coordinates (Feature 2) and enforce the special-folder
+    mapping (Feature 3). Determines the NC account id itself from
+    (user_email, target); if there is no NC mail account yet, both steps are
+    skipped. Each sub-step is isolated so one failing never blocks the other or
+    the wider reconcile."""
     try:
         account_id = nc_maildb.get_account_id(user_email, target)
     except Exception as exc:
@@ -496,6 +500,15 @@ def _provision_nc_maildb(
     except Exception as exc:
         summary["errors"].append(f"nc_maildb sieve {target}: {exc}")
         log.exception("nc_maildb.ensure_sieve_settings for %s/%s failed",
+                      user_email, target)
+
+    # Feature 3 — special-folder mapping enforcement
+    try:
+        for column in nc_maildb.enforce_special_folders(account_id, dry_run=dry_run):
+            summary["nc_mapping_enforced"].append(f"{target}:{column}")
+    except Exception as exc:
+        summary["errors"].append(f"nc_maildb mapping {target}: {exc}")
+        log.exception("nc_maildb.enforce_special_folders for %s/%s failed",
                       user_email, target)
 
 

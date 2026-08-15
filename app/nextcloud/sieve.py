@@ -1,18 +1,31 @@
-"""Nextcloud Mail DB provisioning: ManageSieve settings.
+"""Nextcloud Mail DB provisioning: ManageSieve settings + special-folder
+mapping enforcement.
 
-Nextcloud-AIO's Mail app keeps per-account config in the Postgres table
-``oc_mail_accounts``. Neither ``occ`` nor a REST endpoint lets us set the
-ManageSieve coordinates, so we write those columns directly via
-``docker exec ... psql`` into the Nextcloud database container — exactly the
-same "shell into the container" pattern the Dovecot (``doveadm``) and occ
-wrappers already use. The DB container authenticates the local ``psql`` client
-over its Unix socket (peer / trust auth), so no DB password is needed.
+Nextcloud-AIO's Mail app keeps per-account config in the Postgres tables
+``oc_mail_accounts`` and ``oc_mail_mailboxes``. Neither ``occ`` nor a REST
+endpoint lets us set the ManageSieve coordinates or repair the special-folder
+mapping, so we write those columns directly via ``docker exec ... psql`` into
+the Nextcloud database container — exactly the same "shell into the container"
+pattern the Dovecot (``doveadm``) and occ wrappers already use. The DB
+container authenticates the local ``psql`` client over its Unix socket (peer /
+trust auth), so no DB password is needed.
 
-``ensure_sieve_settings`` points the account at the ManageSieve server. It is
-idempotent (SELECT, diff, only UPDATE on drift) and dry-run aware.
-``sieve_user`` and ``sieve_password`` are left NULL on purpose: Nextcloud Mail
-5.x then falls back to the account's already-stored (encrypted) IMAP
-credentials for the Sieve login, so we never have to touch Nextcloud's crypto.
+Two things happen here, both per managed mail account, both idempotent
+(SELECT, diff, only UPDATE on drift) and both dry-run aware:
+
+Feature 2 — ``ensure_sieve_settings``:
+    Point the account at the ManageSieve server. ``sieve_user`` and
+    ``sieve_password`` are left NULL on purpose: Nextcloud Mail 5.x then falls
+    back to the account's already-stored (encrypted) IMAP credentials for the
+    Sieve login, so we never have to touch Nextcloud's crypto.
+
+Feature 3 — ``enforce_special_folders``:
+    Make sure ``sent_mailbox_id`` / ``drafts_mailbox_id`` / ``trash_mailbox_id``
+    point at the account's *local* ``Sent`` / ``Drafts`` / ``Trash`` folders
+    rather than at a provider's virtual folders (e.g. a ``[Gmail]`` tree left
+    over from a migration). Only repairs an existing wrong mapping when the
+    local folder is present; leaves NULL mappings alone (Nextcloud's own
+    autodetection fills those on the account's first sync).
 
 Security note: the account id is always something *we* determine from
 ``(user_id, email)`` and coerce through ``int()`` before it ever reaches SQL;
@@ -37,13 +50,22 @@ _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
 # ManageSieve TLS modes Nextcloud Mail accepts in ``sieve_ssl_mode``.
 _VALID_SSL_MODES = ("none", "ssl", "tls")
 
+# Account column -> local folder name that it must resolve to. The folder names
+# are the exact ``name`` values Nextcloud stores in ``oc_mail_mailboxes`` for
+# the canonical local special folders.
+_SPECIAL_FOLDER_MAP = (
+    ("sent_mailbox_id", "Sent"),
+    ("drafts_mailbox_id", "Drafts"),
+    ("trash_mailbox_id", "Trash"),
+)
+
 
 class NextcloudMailDBError(RuntimeError):
     pass
 
 
 class NextcloudMailDB:
-    """Direct read/modify of ``oc_mail_accounts`` via
+    """Direct read/modify of ``oc_mail_accounts`` / ``oc_mail_mailboxes`` via
     ``docker exec <container> psql``.
 
     The container name / DB name / DB user are passed in from the service
@@ -214,3 +236,96 @@ class NextcloudMailDB:
             f"WHERE id = {aid};"
         )
         return True
+
+    # ---- Feature 3: special-folder mapping enforcement -------------------
+
+    def enforce_special_folders(self, account_id: int,
+                                dry_run: bool = False) -> list[str]:
+        """Ensure ``sent/drafts/trash_mailbox_id`` point at the account's local
+        ``Sent`` / ``Drafts`` / ``Trash`` folders.
+
+        A column is only repaired when it is currently set (non-NULL) *and*
+        points somewhere other than the local folder *and* that local folder
+        exists (exactly one row). NULL mappings and missing local folders are
+        left untouched (logged) — Nextcloud's own autodetection handles the
+        first sync; we only fix later drift.
+
+        Returns the list of column names that were changed (or would be, in
+        dry-run)."""
+        aid = int(account_id)
+
+        proc = self._psql(
+            "SELECT sent_mailbox_id, drafts_mailbox_id, trash_mailbox_id "
+            f"FROM oc_mail_accounts WHERE id = {aid};",
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise NextcloudMailDBError(
+                f"mapping SELECT for account {aid} failed: "
+                f"{proc.stderr.strip()[:200]}"
+            )
+        rows = self._rows(proc)
+        if not rows:
+            log.info("enforce_special_folders: account id=%s not found — skipping", aid)
+            return []
+        cur = rows[0]
+        cur += [""] * (3 - len(cur))
+        current_by_col = {
+            "sent_mailbox_id": cur[0],
+            "drafts_mailbox_id": cur[1],
+            "trash_mailbox_id": cur[2],
+        }
+
+        # Resolve the local special folders to their mailbox ids. A name that
+        # is absent or duplicated is treated as "not resolvable" (skip).
+        local = self._local_special_folder_ids(aid)
+
+        fixed: list[str] = []
+        for column, folder in _SPECIAL_FOLDER_MAP:
+            current = current_by_col.get(column, "")
+            if current == "":
+                log.info("mapping %s account id=%s is NULL — skipping "
+                         "(NC autodetection owns first sync)", column, aid)
+                continue
+            local_id = local.get(folder)
+            if local_id is None:
+                log.info("mapping %s account id=%s: local folder %r missing/"
+                         "ambiguous — skipping", column, aid, folder)
+                continue
+            if current == str(local_id):
+                continue  # already correct
+            log.info("mapping FIX %s account id=%s: %s -> %s (%r) (dry_run=%s)",
+                     column, aid, current, local_id, folder, dry_run)
+            if not dry_run:
+                self._psql(
+                    f"UPDATE oc_mail_accounts SET {column} = {int(local_id)} "
+                    f"WHERE id = {aid};"
+                )
+            fixed.append(column)
+        return fixed
+
+    def _local_special_folder_ids(self, account_id: int) -> dict[str, int]:
+        """Return ``{folder_name: id}`` for the local Sent/Drafts/Trash folders
+        of *account_id*. A name appearing zero or more-than-once is omitted, so
+        callers can treat a missing key as "not uniquely resolvable"."""
+        aid = int(account_id)
+        names = ", ".join(self._sql_str(f) for _, f in _SPECIAL_FOLDER_MAP)
+        proc = self._psql(
+            "SELECT id, name FROM oc_mail_mailboxes "
+            f"WHERE account_id = {aid} AND name IN ({names});",
+            check=False,
+        )
+        if proc.returncode != 0:
+            log.warning("mailbox lookup for account %s failed: %s",
+                        aid, proc.stderr.strip()[:200])
+            return {}
+        seen: dict[str, list[int]] = {}
+        for row in self._rows(proc):
+            if len(row) < 2:
+                continue
+            mb_id, name = row[0], row[1]
+            try:
+                seen.setdefault(name, []).append(int(mb_id))
+            except ValueError:
+                continue
+        return {name: ids[0] for name, ids in seen.items() if len(ids) == 1}

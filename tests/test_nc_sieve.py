@@ -185,6 +185,91 @@ def test_ensure_sieve_account_not_found_is_noop(monkeypatch):
     assert stub.updates() == []
 
 
+# ---- Feature 3: special-folder mapping enforcement -------------------------
+
+def _mapping_responder(mapping_row, folder_rows):
+    """Build a responder answering the mapping SELECT, the local-folder SELECT
+    and swallowing UPDATEs."""
+    def responder(sql):
+        if sql.startswith("SELECT sent_mailbox_id"):
+            return _cp(stdout=mapping_row)
+        if sql.startswith("SELECT id, name FROM oc_mail_mailboxes"):
+            return _cp(stdout=folder_rows)
+        return _cp()  # UPDATE
+    return responder
+
+
+def test_enforce_fixes_gmail_mapping_and_skips_missing_and_null(monkeypatch):
+    # sent points at a [Gmail] folder id (99), drafts is NULL, trash points at
+    # id 7 but has no local Trash folder.
+    responder = _mapping_responder(
+        mapping_row="99\t\t7",
+        folder_rows="10\tSent",          # only local Sent exists
+    )
+    c, stub = _client(monkeypatch, responder)
+    fixed = c.enforce_special_folders(42)
+
+    assert fixed == ["sent_mailbox_id"]           # only the fixable one
+    ups = stub.updates()
+    assert len(ups) == 1
+    assert "SET sent_mailbox_id = 10" in ups[0]
+    assert "WHERE id = 42" in ups[0]
+
+
+def test_enforce_noop_when_all_correct(monkeypatch):
+    responder = _mapping_responder(
+        mapping_row="10\t11\t12",
+        folder_rows="10\tSent\n11\tDrafts\n12\tTrash",
+    )
+    c, stub = _client(monkeypatch, responder)
+    assert c.enforce_special_folders(42) == []
+    assert stub.updates() == []
+
+
+def test_enforce_fixes_all_three_when_all_wrong(monkeypatch):
+    responder = _mapping_responder(
+        mapping_row="91\t92\t93",
+        folder_rows="10\tSent\n11\tDrafts\n12\tTrash",
+    )
+    c, stub = _client(monkeypatch, responder)
+    fixed = c.enforce_special_folders(42)
+    assert fixed == ["sent_mailbox_id", "drafts_mailbox_id", "trash_mailbox_id"]
+    assert len(stub.updates()) == 3
+
+
+def test_enforce_dry_run_reports_but_does_not_write(monkeypatch):
+    responder = _mapping_responder(
+        mapping_row="99\t\t\t",
+        folder_rows="10\tSent",
+    )
+    c, stub = _client(monkeypatch, responder)
+    fixed = c.enforce_special_folders(42, dry_run=True)
+    assert fixed == ["sent_mailbox_id"]
+    assert stub.updates() == []
+
+
+def test_enforce_skips_ambiguous_local_folder(monkeypatch):
+    # two rows named "Sent" -> not uniquely resolvable -> skip
+    responder = _mapping_responder(
+        mapping_row="99\t\t\t",
+        folder_rows="10\tSent\n20\tSent",
+    )
+    c, stub = _client(monkeypatch, responder)
+    assert c.enforce_special_folders(42) == []
+    assert stub.updates() == []
+
+
+def test_enforce_account_not_found_is_noop(monkeypatch):
+    def responder(sql):
+        if sql.startswith("SELECT sent_mailbox_id"):
+            return _cp(stdout="")  # no account row
+        return _cp()
+
+    c, stub = _client(monkeypatch, responder)
+    assert c.enforce_special_folders(42) == []
+    assert stub.updates() == []
+
+
 # ---- account id lookup / quoting -------------------------------------------
 
 def test_get_account_id_single_row(monkeypatch):
