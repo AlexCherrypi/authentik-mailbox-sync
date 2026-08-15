@@ -7,6 +7,11 @@ Endpoints:
                         reconcile every active user, then garbage-collect
                         users that vanished from Authentik but still have
                         rows in our state DB (X-Sync-Admin-Token)
+- GET  /my-accounts   — OIDC-authenticated per-user endpoint for the
+                        Thunderbird setup tool (T-009d): mints fresh tb-setup
+                        App-Passwords + returns IMAP/SMTP coords + salutation
+                        templates. Gated behind MY_ACCOUNTS_ENABLED (default
+                        off) and the OIDC_* validator config.
 
 Dry-run behaviour: ``SYNC_DRY_RUN=true`` env var or ``?dry_run=1`` query
 param makes the service compute the diff and return what it would do without
@@ -14,9 +19,10 @@ touching Mailcow or Nextcloud. Defaults to OFF.
 """
 import logging
 import os
+import re
 import sys
 
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 
 from .auth import require_token
 from .authentik import AuthentikClient
@@ -26,7 +32,13 @@ from .mailcow.dovecot import DovecotClient
 from .mailcow.memcached import MemcachedClient
 from .nextcloud.occ import NextcloudClient
 from .nextcloud.sieve import NextcloudMailDB
-from .reconcile import reconcile_user
+from .oidc import OidcValidator, require_oidc, set_oidc_validator
+from .reconcile import _generate_password, reconcile_user, tb_marker_for
+from .signatures import (
+    DEFAULT_SIGNATURES_CONFIG_PATH,
+    SignaturesError,
+    load_signatures,
+)
 from .sogo.prefs import SogoPrefs
 from .state import StateDB
 
@@ -87,6 +99,21 @@ if os.environ.get("AUTHENTIK_API_URL") and os.environ.get("AUTHENTIK_API_TOKEN")
         token=os.environ["AUTHENTIK_API_TOKEN"],
         verify=verify,
     )
+
+# OIDC validator for /my-accounts (T-009d). Built only when all three coords
+# are set; otherwise the endpoint fails closed with 503 (require_oidc). aud is
+# the client_id of the dedicated Authentik "mail-setup" provider, so a token
+# minted for any other application is rejected.
+oidc = None
+if all(os.environ.get(k) for k in ("OIDC_ISSUER", "OIDC_JWKS_URL", "OIDC_AUDIENCE")):
+    _oidc_verify = os.environ.get("OIDC_VERIFY", "")
+    oidc = OidcValidator(
+        issuer=os.environ["OIDC_ISSUER"],
+        jwks_url=os.environ["OIDC_JWKS_URL"],
+        audience=os.environ["OIDC_AUDIENCE"],
+        verify=_oidc_verify.strip().lower() not in ("false", "0", "no", "off"),
+    )
+set_oidc_validator(oidc)
 
 
 def _truthy(v: str) -> bool:
@@ -150,6 +177,7 @@ def _reconcile_one(user_payload: dict, dry_run: bool,
         sieve_host=os.environ.get("SIEVE_HOST") or os.environ.get("IMAP_HOST", ""),
         sieve_port=int(os.environ.get("SIEVE_PORT", "4190")),
         sieve_ssl_mode=os.environ.get("SIEVE_SSL_MODE", "tls"),
+        tb_setup_cleanup=_truthy(os.environ.get("MY_ACCOUNTS_ENABLED", "")),
         dry_run=dry_run,
     )
 
@@ -260,3 +288,130 @@ def reconcile_all():
     log.info("reconcile-all DONE authentik=%d orphans=%d dry_run=%s",
              len(authentik_payloads), len(orphan_emails), dry_run)
     return jsonify(summary), 200
+
+
+# --- /my-accounts (Thunderbird setup tool, T-009d) -------------------------
+
+# "device" = <hostname>~<winuser> (D-008 scope). Keep the accepted charset
+# tight — it ends up verbatim in an App-Password name and a state PK.
+_DEVICE_RE = re.compile(r"^[A-Za-z0-9._~@-]{1,128}$")
+
+
+@app.route("/my-accounts", methods=["GET"])
+@require_oidc
+def my_accounts():
+    """Per-user endpoint for the Thunderbird setup tool.
+
+    Auth: OIDC access-JWT (``require_oidc``). Reads identity + entitlements
+    straight from the token claims, mints one fresh ``tb-setup:*`` App-Password
+    per actionable mailbox for this device, and returns everything the client
+    needs to write a Thunderbird profile (server coords + salutation
+    templates). Fresh minting every call because the plaintext is never
+    retrievable afterwards; a prior password for the same (user, target,
+    device) is deleted first so devices don't accumulate credentials."""
+    if not _truthy(os.environ.get("MY_ACCOUNTS_ENABLED", "")):
+        return jsonify({"status": "disabled",
+                        "reason": "MY_ACCOUNTS_ENABLED is off"}), 503
+
+    claims = getattr(g, "oidc_claims", {}) or {}
+    user_email = (claims.get("email") or "").strip()
+    if not user_email:
+        return jsonify({"error": "token has no 'email' claim"}), 400
+
+    device = (request.args.get("device")
+              or request.headers.get("X-Device-Id") or "").strip()
+    if not device:
+        return jsonify({"error": "missing device (query ?device= or "
+                                 "X-Device-Id header)"}), 400
+    if not _DEVICE_RE.match(device):
+        return jsonify({"error": "invalid device identifier"}), 400
+
+    # Salutation templates (D-007) — read fresh per request so edits to the
+    # mounted config take effect without a restart. A broken/missing config is
+    # a 503, not a crash.
+    try:
+        signatures = load_signatures(
+            os.environ.get("SIGNATURES_CONFIG_PATH", DEFAULT_SIGNATURES_CONFIG_PATH)
+        )
+    except SignaturesError as exc:
+        log.error("my-accounts: signatures config error: %s", exc)
+        return jsonify({"error": "signatures config unavailable"}), 503
+
+    our_domain = os.environ["OUR_DOMAIN"]
+    entitlements = [e for e in (claims.get("shared_mailboxes") or [])
+                    if isinstance(e, str)]
+    desired = {e for e in ({user_email, *entitlements})
+               if e.endswith("@" + our_domain)}
+
+    try:
+        all_mailboxes = mailcow.list_mailboxes()
+    except Exception as exc:
+        log.exception("my-accounts: list_mailboxes failed")
+        return jsonify({"error": f"mailcow unavailable: {exc}"}), 502
+    existing = {mb["username"] for mb in all_mailboxes
+                if mb.get("username", "").endswith("@" + our_domain)}
+
+    actionable = sorted(desired & existing)
+    skipped_unknown = sorted(desired - existing)
+
+    imap = {
+        "host": os.environ["IMAP_HOST"],
+        "port": int(os.environ.get("IMAP_PORT", "993")),
+        "security": os.environ.get("IMAP_ENCRYPTION", "ssl"),
+    }
+    smtp = {
+        "host": os.environ["SMTP_HOST"],
+        "port": int(os.environ.get("SMTP_PORT", "465")),
+        "security": os.environ.get("SMTP_ENCRYPTION", "ssl"),
+    }
+
+    accounts = []
+    errors = []
+    for target in actionable:
+        try:
+            # Replace any prior credential for this exact (user, target,
+            # device) so a re-run doesn't leave a dangling app-pwd behind.
+            prior = state.tb_get(user_email, target, device)
+            if prior is not None and prior.mailcow_app_pwd_id is not None:
+                mailcow.delete_app_passwd([prior.mailcow_app_pwd_id])
+
+            password = _generate_password()
+            marker = tb_marker_for(user_email, target, device)
+            # TB core can't do ManageSieve — keep the credential scope minimal
+            # (no sieve_access), unlike the authentik-sync app-pwds.
+            pwd_id = mailcow.add_app_passwd(
+                target, marker, password,
+                protocols=("imap_access", "smtp_access"),
+            )
+            state.tb_upsert(user_email, target, device, mailcow_app_pwd_id=pwd_id)
+        except Exception as exc:
+            log.exception("my-accounts: mint failed user=%s target=%s",
+                          user_email, target)
+            errors.append({"email": target, "error": str(exc)})
+            continue
+
+        accounts.append({
+            "email": target,
+            "is_primary": target == user_email,
+            "imap": imap,
+            "smtp": smtp,
+            "username": target,
+            "app_password": password,  # plaintext ONLY here, never logged/stored
+        })
+
+    log.info("my-accounts user=%s device=%s minted=%d skipped_unknown=%d errors=%d",
+             user_email, device, len(accounts), len(skipped_unknown), len(errors))
+
+    out = {
+        "user": {
+            "email": user_email,
+            "name": claims.get("name"),
+            "preferred_username": claims.get("preferred_username"),
+        },
+        "accounts": accounts,
+        "skipped_unknown": skipped_unknown,
+        "signatures": signatures,
+    }
+    if errors:
+        out["errors"] = errors
+    return jsonify(out), 200
