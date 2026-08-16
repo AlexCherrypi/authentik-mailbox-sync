@@ -29,6 +29,24 @@ CREATE TABLE IF NOT EXISTS sync_users_seen (
     user_email TEXT PRIMARY KEY,
     last_seen  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Thunderbird-setup App-Passwords (T-009d). DELIBERATELY SEPARATE from
+-- sync_mailboxes: the authentik-sync lifecycle (adopt / add / remove) must
+-- never touch these rows, and this cleanup must never touch authentik-sync
+-- rows. Keyed by (user, target, device) — "device" = <hostname>~<winuser>
+-- (D-008 scope) so each Windows world has its own independently
+-- replaceable/revocable password.
+CREATE TABLE IF NOT EXISTS tb_setup_pwds (
+    user_email           TEXT NOT NULL,
+    target_email         TEXT NOT NULL,
+    device               TEXT NOT NULL,
+    mailcow_app_pwd_id   INTEGER,
+    first_seen           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_email, target_email, device)
+);
+CREATE INDEX IF NOT EXISTS idx_tb_setup_pwds_user
+    ON tb_setup_pwds(user_email);
 """
 
 
@@ -48,6 +66,27 @@ class MailboxRow:
             target_email=row["target_email"],
             mailcow_app_pwd_id=row["mailcow_app_pwd_id"],
             nc_account_id=row["nc_account_id"],
+            first_seen=row["first_seen"],
+            last_seen=row["last_seen"],
+        )
+
+
+@dataclass
+class TbSetupRow:
+    user_email: str
+    target_email: str
+    device: str
+    mailcow_app_pwd_id: Optional[int]
+    first_seen: str
+    last_seen: str
+
+    @classmethod
+    def from_sqlite(cls, row) -> "TbSetupRow":
+        return cls(
+            user_email=row["user_email"],
+            target_email=row["target_email"],
+            device=row["device"],
+            mailcow_app_pwd_id=row["mailcow_app_pwd_id"],
             first_seen=row["first_seen"],
             last_seen=row["last_seen"],
         )
@@ -154,3 +193,62 @@ class StateDB:
                 "SELECT user_email FROM sync_users_seen ORDER BY user_email"
             ).fetchall()
         return [r["user_email"] for r in rows]
+
+    # ---- tb-setup App-Password CRUD (T-009d) -----------------------------
+    # Kept fully separate from the sync_mailboxes CRUD above so the two
+    # lifecycles can never cross.
+
+    def tb_get(self, user_email: str, target_email: str, device: str
+               ) -> Optional[TbSetupRow]:
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT * FROM tb_setup_pwds "
+                "WHERE user_email = ? AND target_email = ? AND device = ?",
+                (user_email, target_email, device),
+            ).fetchone()
+        return TbSetupRow.from_sqlite(row) if row else None
+
+    def tb_get_for_user(self, user_email: str) -> list[TbSetupRow]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM tb_setup_pwds WHERE user_email = ? "
+                "ORDER BY target_email, device",
+                (user_email,),
+            ).fetchall()
+        return [TbSetupRow.from_sqlite(r) for r in rows]
+
+    def tb_all(self) -> list[TbSetupRow]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT * FROM tb_setup_pwds ORDER BY user_email, target_email, device"
+            ).fetchall()
+        return [TbSetupRow.from_sqlite(r) for r in rows]
+
+    def tb_upsert(
+        self,
+        user_email: str,
+        target_email: str,
+        device: str,
+        *,
+        mailcow_app_pwd_id: Optional[int] = None,
+    ) -> None:
+        with self.conn() as c:
+            c.execute(
+                """
+                INSERT INTO tb_setup_pwds (user_email, target_email, device,
+                                           mailcow_app_pwd_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_email, target_email, device) DO UPDATE SET
+                    mailcow_app_pwd_id = excluded.mailcow_app_pwd_id,
+                    last_seen          = CURRENT_TIMESTAMP
+                """,
+                (user_email, target_email, device, mailcow_app_pwd_id),
+            )
+
+    def tb_delete(self, user_email: str, target_email: str, device: str) -> None:
+        with self.conn() as c:
+            c.execute(
+                "DELETE FROM tb_setup_pwds "
+                "WHERE user_email = ? AND target_email = ? AND device = ?",
+                (user_email, target_email, device),
+            )

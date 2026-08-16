@@ -1,0 +1,10 @@
+{
+  "firmenanrede": {
+    "html": "<p>Mit freundlichen Gr&uuml;&szlig;en<br>Lammers &amp; Kr&uuml;ger GBR</p>",
+    "from_name": "Lammers & Krüger GBR"
+  },
+  "persoenliche_anrede": {
+    "html": "<p>Mit freundlichen Gr&uuml;&szlig;en<br>{{name}}<br>Lammers &amp; Kr&uuml;ger GBR</p>",
+    "from_name": "{{name}} | Lammers & Krüger"
+  }
+}

@@ -40,6 +40,7 @@ without touching user-created objects.
 | GET    | `/healthz`       | none                          | Liveness + DB + Mailcow-API reachability  |
 | POST   | `/reconcile`     | `X-Authentik-Webhook-Token`   | Reconcile one user (webhook payload)      |
 | POST   | `/reconcile-all` | `X-Reconciler-Admin-Token`    | Full sweep — call from cron               |
+| GET    | `/my-accounts`   | OIDC access-JWT (Bearer)      | Per-user mailbox provisioning for the Thunderbird setup tool (opt-in) |
 
 ## Layout
 
@@ -108,6 +109,60 @@ Host/port/mode are validated before they reach SQL (host charset, numeric port
 in range, mode ∈ {`tls`,`ssl`,`none`}); the account id is always determined by
 the service from `(user_id, email)` and coerced to `int`, never taken from
 caller input.
+
+## `GET /my-accounts` — Thunderbird setup tool (T-009d)
+
+An OIDC-authenticated, per-user endpoint used by the *LK-Mail-Einrichtung*
+Thunderbird setup tool. The tool logs the user in against Authentik (Auth Code +
+PKCE) and calls this endpoint with the resulting **access-JWT** as a
+`Authorization: Bearer` header. The token is validated **locally** against the
+provider's JWKS (`app/oidc.py`: RS256, `iss`/`aud`/`exp`/`nbf`/`iat`); `aud` is
+the client_id of the dedicated *mail-setup* provider, so tokens minted for any
+other application are worthless here.
+
+Identity and entitlements are read straight from the token claims (`email`,
+`name`, `preferred_username`, and the `shared_mailboxes` claim, which mirrors the
+AMS-internal aggregation). For each entitled mailbox that actually exists in
+Mailcow the endpoint **mints a fresh App-Password** named
+`tb-setup:<user>:<target>:<device>` and returns it once, in plaintext, in the
+response — it is never logged or stored (only the Mailcow id is kept in state).
+
+- **`device`** (required) — `?device=<id>` query param or `X-Device-Id` header;
+  the tool sends `<hostname>~<winuser>` (D-008 scope). A re-run for the same
+  `(user, target, device)` **replaces** the previous password (no sprawl).
+- **Naming invariant** — tb-setup passwords use the `tb-setup:` prefix and
+  **never** `authentik-sync:`. That keeps them out of the authentik-sync
+  lifecycle: `adopt_from_markers` only adopts `authentik-sync:*`, and the
+  authentik-sync remove path only deletes state-tracked ids. Enforced by tests
+  in `tests/test_tb_sweep_cleanup.py`.
+- **Salutation templates** (D-007) — the response carries the two variants
+  (`firmenanrede`, `persoenliche_anrede`) read fresh per request from the
+  JSON file at `SIGNATURES_CONFIG_PATH` (a mounted volume — see
+  [`signatures.example.json`](signatures.example.json)). The `{{name}}`
+  placeholder is delivered raw; the client substitutes the real display name.
+
+Response shape:
+
+```json
+{
+  "user": {"email": "...", "name": "...", "preferred_username": "..."},
+  "accounts": [
+    {"email": "...", "is_primary": true,
+     "imap": {"host": "...", "port": 993, "security": "ssl"},
+     "smtp": {"host": "...", "port": 587, "security": "starttls"},
+     "username": "...", "app_password": "<plaintext, once>"}
+  ],
+  "skipped_unknown": ["claimed-but-no-mailbox@..."],
+  "signatures": {"firmenanrede": {...}, "persoenliche_anrede": {...}}
+}
+```
+
+**Revocation** (D-005): the `/reconcile-all` sweep deletes tb-setup passwords
+whose `(user, target)` entitlement has been withdrawn, so removing a user from
+the Authentik group revokes already-provisioned Thunderbird clients within one
+sweep. Both the endpoint and this cleanup are gated behind
+`MY_ACCOUNTS_ENABLED` (default **`false`**): a deploy with the flag off serves
+no endpoint and never touches `tb_setup_pwds`.
 
 ## Configuration
 
